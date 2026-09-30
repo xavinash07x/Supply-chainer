@@ -1,5 +1,7 @@
 # Supplychainer: Context-Aware Agentic Routing Engine
 
+**Improved challenge version:** Start with [RUN_ME_FIRST.md](RUN_ME_FIRST.md) for Windows launch scripts, the verified Suez demonstration, changes and limitations. See [VERIFICATION.md](VERIFICATION.md) for test results.
+
 > **An NLP-driven Risk Assessment API & Executive Command Dashboard for Dynamic Supply Chain Graph Routing.**
 
 Traditional supply chain routing algorithms (like Dijkstra or A*) rely on static distances. But in the real world, supply chains are disrupted by dynamic **Black Swan events**—hurricanes, worker strikes, and geopolitical blockades. 
@@ -14,7 +16,7 @@ Traditional supply chain routing algorithms (like Dijkstra or A*) rely on static
 
 * **Real-time Threat Intelligence**: Monitors global RSS feeds to detect local disruptions before they trap inventory.
 * **Context-Aware Relevance Filter (CARF)**: Eliminates false positives (e.g., ignoring a seaport strike if the transport mode is Rail).
-* **Quantile ML Risk Assessment**: Uses a Gradient Boosting Regressor trained on 50,000+ real-world historical incidents to predict the **worst-case p85 scenario buffer**, not just the mean delay.
+* **Quantile ML Risk Assessment**: Uses the supplied Gradient Boosting quantile regressor to predict a calibrated **per-leg p85 delay buffer**. The repository data builder generates samples from benchmark anchors; these are not 50,000 independently verified shipment logs.
 * **Executive Dashboard**: A visually stunning 3-column command interface featuring real-time tradeoff strips, operational configuration drop-downs, and forensic audit trails.
 
 ---
@@ -162,7 +164,7 @@ npm run dev
   ]
 }
 ```
-*(Captured from a real run against the trained model and canonical hub graph — not illustrative placeholder data.)*
+*(Upstream response captured before the fixes in this version; see VERIFICATION.md for current route and audit results.)*
 
 There's a second, older prototype endpoint, `POST /predict_route_risk` in `Execution/api.py`. It is **not** part of the live app (nothing imports or serves it from `backend/main.py`) — it's a standalone leftover from an earlier iteration and isn't wired to the frontend.
 
@@ -205,16 +207,15 @@ opportunities are if you want to push it toward something a real logistics team 
 
 ### Smarter AI/ML
 - **Wire the trained ML model into live routing.** `ThreatIntelligencePredictor.predict_worst_case_delay()`
-  — the p85 quantile model — is loaded and warmed up at startup but never actually called by
-  `RouteRecommender.recommend()` today. Only the NLP+CARF semantic score currently feeds route
-  weighting. Connecting the model's real delay prediction into the routing decision is one of
-  the most meaningful upgrades available in this codebase.
+  — the p85 quantile model — is now connected through batch inference in the improved
+  `RouteRecommender.recommend()` implementation. The same buffers feed route weights and the
+  ETA audit. Calibration metadata and unsupported hub substitutions are shown in the dashboard.
 - Predict multiple quantiles (p50 / p85 / p95) instead of a single point estimate, for a
   confidence band instead of one number.
 - Add real explainability (e.g. SHAP or permutation importance) to the model's predictions,
   surfaced through the existing `audit_trace`.
 - Generalize `CARFFilter` to rail and road with the same rigor it already applies to air/sea —
-  it defines relevance keywords for all four modes but only enforces two of them today.
+  the improved filter now enforces mode relevance for all four modes.
 - Categorize threat *type* (strike / weather / geopolitical / infrastructure), not just
   magnitude, so downstream logic can react differently to different kinds of disruption.
 
@@ -238,7 +239,7 @@ opportunities are if you want to push it toward something a real logistics team 
 - Persist state in a real database instead of in-memory Python objects — right now a restart
   wipes everything, and there's no per-user or per-company data isolation.
 - Add authentication and basic multi-tenancy.
-- Add automated tests — there currently aren't any, for either the backend or the frontend.
+- Extend automated tests — this version includes 22 backend/API regression tests.
 - Cache or pre-compute more of the graph-weighting work so the engine scales past a few
   hundred nodes without the per-request cost growing with it.
 

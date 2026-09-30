@@ -110,7 +110,9 @@ def get_network():
 @app.get("/api/status")
 def get_status():
     return {
-        "ml_trained": True,
+        "ml_trained": predictor.is_trained,
+        "nlp_available": recommender.nlp._ready,
+        "demo_mode": DEMO_MODE,
         "active_trips": len(simulator.active_trips),
         "tick": simulator.time_tick,
         "is_supplychainer": True,
@@ -128,11 +130,12 @@ async def websocket_endpoint(websocket: WebSocket):
             elif not recommender.is_warmed_up:
                 status_msg = "WARMING RISK ENGINE"
             else:
-                status_msg = "FULLY OPERATIONAL"
+                status_msg = "ML READY / SCENARIO DEMO" if DEMO_MODE else (
+                    "FULLY OPERATIONAL" if recommender.nlp._ready else "ML READY / NLP OFFLINE")
                 
             state = {
                 "tick": simulator.time_tick,
-                "ml_trained": True,
+                "ml_trained": predictor.is_trained,
                 "engine_status": status_msg,
                 "hub_registry": "Synchronized"
             }

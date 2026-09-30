@@ -267,21 +267,33 @@ const RouteRecommender = ({ onNavigate }) => {
           <div style={{display: 'flex', flexDirection: 'column', gap: '1rem'}}>
             <div className="audit-trace-box" style={{borderLeft: '4px solid #3b82f6'}}>
                <div style={{marginBottom: '0.5rem', fontWeight: 700, color: '#f8fafc'}}>Forensic ETA Audit</div>
-               <div>Transit: {recommendations[0].audit_trace.eta.transit}h</div>
-               <div>Transfer: +{recommendations[0].audit_trace.eta.transfer}h</div>
-               <div>Scenario Impact: {recommendations[0].audit_trace.eta.scenario > 0 ? `+${recommendations[0].audit_trace.eta.scenario}h` : 'None'}</div>
+               <div>Transit: {recommendations[0].audit_trace.eta.transit.toFixed(1)}h</div>
+               <div>Transfer: +{recommendations[0].audit_trace.eta.transfer.toFixed(1)}h</div>
+               <div>Model Delay Buffer: +{(recommendations[0].audit_trace.eta.model || 0).toFixed(1)}h</div>
+               <div>Additional Scenario Impact: {recommendations[0].audit_trace.eta.scenario > 0 ? `+${recommendations[0].audit_trace.eta.scenario.toFixed(1)}h` : 'None'}</div>
             </div>
 
             <div className="audit-trace-box" style={{borderLeft: '4px solid #10b981'}}>
                <div style={{marginBottom: '0.5rem', fontWeight: 700, color: '#f8fafc'}}>Cost Composition</div>
                <div>Landed Base: ${recommendations[0].audit_trace.cost.transit.toLocaleString()}</div>
                <div>Transfer Fees: ${recommendations[0].audit_trace.cost.transfer.toLocaleString()}</div>
-               <div>Risk Premium: ${recommendations[0].audit_trace.cost.scenario.toLocaleString()}</div>
+               <div>Scenario Surcharge: ${recommendations[0].audit_trace.cost.scenario.toLocaleString()}</div>
+            </div>
+
+            <div className="audit-trace-box" style={{borderLeft: '4px solid #8b5cf6'}}>
+              <div style={{marginBottom: '0.5rem', fontWeight: 700, color: '#f8fafc'}}>Delay Prediction Evidence</div>
+              {recommendations[0].legs.filter(leg => leg.delay_prediction).map((leg, index) => (
+                <div key={index} style={{marginBottom: '0.75rem'}}>
+                  <strong>{leg.to_name} ({leg.mode})</strong>
+                  <div>{leg.delay_prediction.prediction_source === 'ML_P85' ? 'Calibrated per-leg p85 model' : 'Operational fallback'}: +{leg.model_delay.toFixed(1)}h</div>
+                  <div>{leg.delay_prediction.calibration_reason}</div>
+                </div>
+              ))}
             </div>
 
             <div className="audit-trace-box" style={{borderLeft: '4px solid #f59e0b'}}>
                <div style={{marginBottom: '0.5rem', fontWeight: 700, color: '#f8fafc'}}>Strategic Truth Anchor</div>
-               <div>Verified against Split-Node Forensic Architecture. 0ms co-location miracles detected.</div>
+               <div>{recommendations[0].delay_method}</div>
             </div>
           </div>
         ) : (
@@ -294,7 +306,7 @@ const RouteRecommender = ({ onNavigate }) => {
         <div style={{marginTop: 'auto'}}>
           <div style={{display: 'flex', alignItems: 'center', gap: '0.5rem', background: 'rgba(59, 130, 246, 0.1)', padding: '0.75rem', borderRadius: '8px', border: '1px solid #3b82f6'}}>
             <ShieldCheck size={16} color="#3b82f6" />
-            <span style={{fontSize: '0.65rem', fontWeight: 800, color: '#3b82f6'}}>TRUTH AUDIT VERIFIED</span>
+            <span style={{fontSize: '0.65rem', fontWeight: 800, color: '#3b82f6'}}>DELAY EVIDENCE AVAILABLE</span>
           </div>
         </div>
       </aside>

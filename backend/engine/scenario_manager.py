@@ -74,19 +74,17 @@ class ScenarioManager:
         return None
 
     def get_active_disruptions(self) -> Dict[str, Any]:
-        if not self.active_scenario_id:
+        return self.get_disruptions(self.active_scenario_id)
+
+    def get_disruptions(self, scenario_id: Optional[str]) -> Dict[str, Any]:
+        """Return a scenario snapshot without mutating shared activation state."""
+        scenario = self.SCENARIOS.get(scenario_id)
+        if not scenario:
             return {}
-        
-        scenario = self.SCENARIOS[self.active_scenario_id]
-        disruptions = {}
-        for node in scenario["affected_nodes"]:
-            disruptions[node] = {
-                "delay": scenario["delay_hours"],
-                "threat": scenario["threat_level"],
-                "reason": scenario["reason"],
-                "source": "SCENARIO_OVERRIDE"
-            }
-        return disruptions
+        return {node: {"delay": scenario["delay_hours"], "threat": scenario["threat_level"],
+                       "reason": scenario["reason"], "mode": scenario["mode"],
+                       "source": "SCENARIO_OVERRIDE"}
+                for node in scenario["affected_nodes"]}
 
     def get_all_scenarios(self) -> List[Dict[str, Any]]:
         return [{"id": k, **v} for k, v in self.SCENARIOS.items()]

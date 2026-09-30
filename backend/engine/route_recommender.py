@@ -1,9 +1,7 @@
 import networkx as nx
 import math
-import time
-from typing import List, Dict, Any, Optional
 from .multimodal_network import MODE_PROFILES, create_multimodal_network
-from .threat_intelligence import ThreatIntelligencePredictor, ContrastiveNLPEngine, CARFFilter
+from .threat_intelligence import ContrastiveNLPEngine, CARFFilter
 from .news_ingestion import DynamicNewsIngestor
 from .node_resolver import NodeResolver
 
@@ -42,13 +40,14 @@ class RouteRecommender:
             self.predictor.warmup()
             self.nlp.warmup()
             
-            # Enrich unified graph with baseline intelligence
+            # Only four fallback texts exist; score each once, not once per edge.
+            baseline = {}
+            for mode, news in self.news_ingestor.fallback_news.items():
+                baseline[mode] = (news, self.carf.apply_filter(self.nlp.get_semantic_score(news), news, mode))
             for u, v, d in self.unified_graph.edges(data=True):
                 mode = d.get("transport_mode", "road")
                 if mode == "transfer": continue
-                news = self.news_ingestor.fallback_news.get(mode, "Normal conditions.")
-                score = self.nlp.get_semantic_score(news)
-                threat = self.carf.apply_filter(score, news, mode)
+                news, threat = baseline.get(mode, ("Normal conditions.", 0.0))
                 self.unified_graph[u][v]["base_threat"] = threat
                 self.unified_graph[u][v]["base_news"] = news
                 
@@ -58,185 +57,156 @@ class RouteRecommender:
             print(f"[WARMUP] Error during warmup: {e}")
             self.warmup_failed = True
 
-    def recommend(self, source: str, destination: str, transport_preference: str = "any", 
-                  routing_policy: str = "STRICT", cargo_type: str = "general", 
-                  priority: str = "normal", scenario: str = None, 
+    def _prepare_intelligence(self, graph, disruptions):
+        """Resolve each edge once; the solver and response share the same delay numbers."""
+        requests, edges = [], []
+        for u, v, edge in graph.edges(data=True):
+            mode = edge["transport_mode"]
+            baseline_threat = max(0.0, min(1.0, edge.get("base_threat", edge.get("risk", 0.0))))
+            disruption = disruptions.get(graph.nodes[v].get("physical_id"), {})
+            if mode == "transfer" or disruption.get("mode") != mode:
+                disruption = {}
+            threat = max(baseline_threat, disruption.get("threat", 0.0))
+            edge["intelligence"] = {
+                "baseline_threat": baseline_threat, "threat": threat,
+                "scenario_delay": disruption.get("delay", 0.0),
+                "reason": disruption.get("reason", edge.get("base_news", "Standard conditions")),
+                "intel_source": "SCENARIO" if disruption else "FALLBACK",
+                "prediction": None, "model_delay": 0.0, "scenario_increment": 0.0,
+            }
+            if mode == "transfer":
+                continue
+            def model_location(node):
+                data = graph.nodes[node]
+                return data.get("parent_city") or data.get("display_name", node)
+            requests.append(dict(origin=model_location(u), destination=model_location(v),
+                transport_mode=mode, leg_type="Global_Freight" if mode in ("air", "sea") else "Last_Mile",
+                condition_flag="Clear", nlp_score=threat))
+            edges.append(edge)
+        predictions = self.predictor.predict_worst_case_delays(requests)
+        for edge, prediction in zip(edges, predictions):
+            intel = edge["intelligence"]
+            delay = float(prediction["final_delay_presented"])
+            if not math.isfinite(delay) or delay < 0:
+                raise ValueError("Delay predictor returned an invalid buffer")
+            intel["prediction"] = prediction
+            intel["model_delay"] = delay
+            # The model already sees scenario severity. Treat a scripted delay as a
+            # minimum buffer; adding the full scenario would count the same risk twice.
+            intel["scenario_increment"] = max(0.0, intel["scenario_delay"] - delay)
+
+    def recommend(self, source: str, destination: str, transport_preference: str = "any",
+                  routing_policy: str = "STRICT", cargo_type: str = "general",
+                  priority: str = "normal", scenario: str = None,
                   overrides: dict = None) -> dict:
-        
-        t0 = time.perf_counter()
+        if transport_preference not in {"any", "air", "sea", "rail", "road"}:
+            return {"error": "Unknown transport preference"}
+        if routing_policy not in {"STRICT", "PREFERRED"}:
+            return {"error": "Unknown routing policy"}
+        if scenario and scenario not in self.scenario_mgr.SCENARIOS:
+            return {"error": "Unknown disruption scenario"}
         overrides = overrides or {}
         avoid_hubs = overrides.get("avoid_chokepoints", [])
         cost_ceiling = overrides.get("cost_ceiling", 999999)
         max_delay = overrides.get("max_delay", 9999)
-        
-        # 1. Resolve Entry/Exit (Virtual Nodes)
         res_s = self.resolver.resolve_node_to_entry_point(source)
         res_d = self.resolver.resolve_node_to_entry_point(destination)
-        
         if "error" in res_s: return {"error": res_s["error"]}
         if "error" in res_d: return {"error": res_d["error"]}
-        
         s_vnode, d_vnode = res_s["id"], res_d["id"]
-        
-        # 2. Scenario Activation
-        active_scenario = self.scenario_mgr.activate_scenario(scenario)
-        disruptions = self.scenario_mgr.get_active_disruptions()
-        
-        # 3. Persona Optimization
+
+        # Request-local scenarios cannot be overwritten by a concurrent request.
+        active_scenario = self.scenario_mgr.SCENARIOS.get(scenario)
+        disruptions = self.scenario_mgr.get_disruptions(scenario)
+        graph = self.unified_graph.copy()
+        graph.remove_nodes_from([n for n, d in graph.nodes(data=True)
+                                 if d.get("physical_id") in avoid_hubs])
+        remove_edges = []
+        for u, v, edge in graph.edges(data=True):
+            mode = edge["transport_mode"]
+            if cargo_type in MODE_PROFILES.get(mode, {}).get("cargo_restrictions", []):
+                remove_edges.append((u, v))
+            elif transport_preference != "any" and routing_policy == "STRICT":
+                if mode not in {transport_preference, "transfer", "road"}:
+                    remove_edges.append((u, v))
+        graph.remove_edges_from(remove_edges)
+        if s_vnode not in graph or d_vnode not in graph:
+            return {"error": "An endpoint is excluded by the hub avoidance constraints"}
+        self._prepare_intelligence(graph, disruptions)
+
         candidates = []
         for persona in ["FASTEST", "SAFEST", "BALANCED"]:
+            def weight_func(u, v, edge):
+                intel = edge["intelligence"]
+                eta = edge["baseline_time"] + intel["model_delay"] + intel["scenario_increment"]
+                threat = intel["threat"]
+                if persona == "FASTEST":
+                    weight = eta
+                elif persona == "SAFEST":
+                    weight = eta * (1.0 + threat * 12.0)
+                else:
+                    weight = eta * 0.3 + edge.get("cost", 0) / 150.0 * 0.5 + threat * 40.0 * 0.2
+                if routing_policy == "PREFERRED" and transport_preference != "any":
+                    if edge["transport_mode"] not in {transport_preference, "transfer", "road"}:
+                        weight *= 1.25
+                return weight
             try:
-                # Build Persona Graph (Applying STRICT constraints)
-                G_p = self.unified_graph.copy()
-                
-                # Apply Hub Avoidance (Prune all virtual nodes for the hub)
-                for hub_id in avoid_hubs:
-                    nodes_to_remove = [n for n, d in G_p.nodes(data=True) if d.get("physical_id") == hub_id]
-                    G_p.remove_nodes_from(nodes_to_remove)
-                
-                # Apply Transport Preference
-                if transport_preference != "any" and routing_policy == "STRICT":
-                    allowed_modes = [transport_preference, "transfer", "road"]
-                    edges_to_remove = []
-                    for u, v, d in G_p.edges(data=True):
-                        if d["transport_mode"] not in allowed_modes:
-                            edges_to_remove.append((u, v))
-                    G_p.remove_edges_from(edges_to_remove)
-
-                def weight_func(u, v, d):
-                    mode = d["transport_mode"]
-                    base_t = d["baseline_time"]
-                    base_c = d.get("cost", 0)
-                    
-                    # Intelligence Factor (Mapped to physical node)
-                    v_data = G_p.nodes[v]
-                    p_id = v_data.get("physical_id")
-                    
-                    threat = d.get("base_threat", 0.05)
-                    delay = 0
-                    
-                    if p_id in disruptions:
-                        threat = max(threat, disruptions[p_id]["threat"])
-                        delay += disruptions[p_id]["delay"]
-                    
-                    if persona == "FASTEST":
-                        return base_t + delay
-                    elif persona == "SAFEST":
-                        risk_penalty = 1.0 + (threat * 12.0)
-                        return (base_t + delay) * risk_penalty
-                    else: # BALANCED (ECONOMIC leaning)
-                        # High cost penalty for transfers and expensive modes
-                        time_weight = 0.3
-                        cost_weight = 0.5
-                        risk_weight = 0.2
-                        return (base_t + delay)*time_weight + (base_c / 150.0)*cost_weight + (threat * 40.0)*risk_weight
-
-                path = nx.dijkstra_path(G_p, s_vnode, d_vnode, weight=weight_func)
-                
-                # Compose Multimodal Path Details
-                legs = []
-                total_time, total_cost, max_threat = 0, 0, 0
-                trace = {
-                    "eta": {"transit": 0, "transfer": 0, "scenario": 0},
-                    "cost": {"transit": 0, "transfer": 0, "scenario": 0},
-                    "risk": {"baseline": 0, "scenario": 0}
-                }
-
-                for i in range(len(path)-1):
-                    u, v = path[i], path[i+1]
-                    d = G_p[u][v]
-                    mode = d["transport_mode"]
-                    v_data = G_p.nodes[v]
-                    p_id = v_data.get("physical_id")
-                    
-                    l_time = d["baseline_time"]
-                    l_cost = d.get("cost", 0)
-                    l_threat = d.get("base_threat", 0.05)
-                    l_news = d.get("base_news", "Standard conditions")
-                    l_source = "FALLBACK"
-                    
-                    if p_id in disruptions:
-                        l_time += disruptions[p_id]["delay"]
-                        l_threat = max(l_threat, disruptions[p_id]["threat"])
-                        l_news = disruptions[p_id]["reason"]
-                        l_source = "SCENARIO"
-                        trace["eta"]["scenario"] += disruptions[p_id]["delay"]
-                        trace["risk"]["scenario"] = max(trace["risk"]["scenario"], l_threat)
-                        trace["cost"]["scenario"] += (l_cost * 0.1)
-                    
-                    if d["type"] == "transfer":
-                        trace["eta"]["transfer"] += l_time
-                        trace["cost"]["transfer"] += l_cost
-                    else:
-                        trace["eta"]["transit"] += l_time
-                        trace["cost"]["transit"] += l_cost
-                        trace["risk"]["baseline"] = max(trace["risk"]["baseline"], l_threat)
-
-                    total_time += l_time
-                    total_cost += l_cost
-                    max_threat = max(max_threat, l_threat)
-                    
-                    legs.append({
-                        "from": G_p.nodes[u].get("physical_id", u),
-                        "to": p_id,
-                        "to_name": v_data.get("display_name", p_id),
-                        "mode": mode.upper(),
-                        "type": d["type"],
-                        "eta": round(l_time, 1),
-                        "cost": round(l_cost, 2),
-                        "threat": round(l_threat, 2),
-                        "reason": l_news,
-                        "intel_source": l_source
-                    })
-
-                if total_cost > cost_ceiling or total_time > (max_delay * 24): continue
-
-                candidates.append({
-                    "persona": persona,
-                    "primary_mode": "MULTIMODAL",
-                    "legs": legs,
-                    "adjusted_eta": round(total_time, 1),
-                    "total_cost": round(total_cost, 2),
-                    "threat_level": round(max_threat, 2),
-                    "audit_trace": trace,
-                    "explanation": self._generate_forensic_explanation(persona, trace, max_threat),
-                    "override_applied": bool(avoid_hubs or cost_ceiling < 999999)
-                })
-
+                path = nx.dijkstra_path(graph, s_vnode, d_vnode, weight=weight_func)
             except nx.NetworkXNoPath:
                 continue
-            except Exception as e:
-                print(f"[ROUTING ERROR] {persona}: {e}")
-
+            legs, transfer_count = [], 0
+            trace = {"eta": {"transit": 0.0, "transfer": 0.0, "model": 0.0, "scenario": 0.0},
+                     "cost": {"transit": 0.0, "transfer": 0.0, "scenario": 0.0},
+                     "risk": {"baseline": 0.0, "scenario": 0.0}}
+            for u, v in zip(path, path[1:]):
+                edge, v_data = graph[u][v], graph.nodes[v]
+                intel = edge["intelligence"]
+                component = "transfer" if edge["type"] == "transfer" else "transit"
+                transfer_count += int(component == "transfer")
+                trace["eta"][component] += edge["baseline_time"]
+                trace["eta"]["model"] += intel["model_delay"]
+                trace["eta"]["scenario"] += intel["scenario_increment"]
+                trace["cost"][component] += edge.get("cost", 0.0)
+                trace["risk"]["baseline"] = max(trace["risk"]["baseline"], intel["baseline_threat"])
+                if intel["intel_source"] == "SCENARIO":
+                    trace["risk"]["scenario"] = max(trace["risk"]["scenario"], intel["threat"])
+                legs.append({
+                    "from": graph.nodes[u].get("physical_id", u),
+                    "to": v_data.get("physical_id", v),
+                    "to_name": v_data.get("display_name", v),
+                    "mode": edge["transport_mode"].upper(), "type": edge["type"],
+                    "eta": round(edge["baseline_time"] + intel["model_delay"] + intel["scenario_increment"], 1),
+                    "baseline_eta": round(edge["baseline_time"], 1),
+                    "model_delay": intel["model_delay"], "scenario_delay": intel["scenario_delay"],
+                    "scenario_increment": round(intel["scenario_increment"], 2),
+                    "cost": round(edge.get("cost", 0.0), 2), "threat": round(intel["threat"], 2),
+                    "reason": intel["reason"], "intel_source": intel["intel_source"],
+                    "delay_prediction": intel["prediction"]})
+            total_time, total_cost = sum(trace["eta"].values()), sum(trace["cost"].values())
+            if total_cost > cost_ceiling or total_time > max_delay * 24:
+                continue
+            max_threat = max((l["threat"] for l in legs), default=0.0)
+            candidates.append({"persona": persona, "primary_mode": "MULTIMODAL", "legs": legs,
+                "adjusted_eta": round(total_time, 1), "total_cost": round(total_cost, 2),
+                "threat_level": max_threat, "audit_trace": trace,
+                "explanation": self._generate_forensic_explanation(persona, trace, max_threat, transfer_count),
+                "override_applied": bool(overrides),
+                "delay_method": "Sum of per-leg calibrated buffers; not a route-level p85 guarantee"})
         if not candidates:
-            return {"error": "No valid multimodal route établi under current strategic constraints."}
+            return {"error": "No valid multimodal route under current strategic constraints"}
+        final, seen = [], set()
+        for candidate in sorted(candidates, key=lambda x: x["adjusted_eta"]):
+            signature = tuple((leg["from"], leg["to"], leg["mode"]) for leg in candidate["legs"])
+            if signature not in seen:
+                final.append(candidate); seen.add(signature)
+        return {"origin": source, "destination": destination,
+                "active_scenario": active_scenario["name"] if active_scenario else None,
+                "recommendations": final[:3]}
 
-        # Deduplicate and sort
-        final = []
-        seen = set()
-        for c in sorted(candidates, key=lambda x: x["adjusted_eta"]):
-            path_sig = tuple([l["to"] for l in c["legs"]])
-            if path_sig not in seen:
-                final.append(c)
-                seen.add(path_sig)
-
-        return {
-            "origin": source, "destination": destination,
-            "active_scenario": active_scenario["name"] if active_scenario else None,
-            "recommendations": final[:3]
-        }
-
-    def _generate_forensic_explanation(self, persona, trace, threat):
-        """
-        Generates quantitative, decision-defensible explanations as required by TEST 5.
-        """
-        eta = trace["eta"]["transit"] + trace["eta"]["transfer"] + trace["eta"]["scenario"]
-        cost = trace["cost"]["transit"] + trace["cost"]["transfer"] + trace["cost"]["scenario"]
-        transfer_count = round(trace["eta"]["transfer"] / 4.0) # Approx transfers
-        
-        if persona == "FASTEST":
-            return f"Velocity-optimized. Mode handoffs applied to reduce transit time by {round(trace['eta']['transit']*0.2, 1)}h vs pure surface transport. {transfer_count} strategic transfers enforced."
-        elif persona == "SAFEST":
-             return f"Resilience-optimized. Path selection reduces risk exposure by {round((1.0 - threat)*100)}% by bypassing volatile corridors. Lead-time integrity prioritized over cost."
-        else:
-             return f"Economic-optimized. Multimodal balance reduces total landed cost by {round(cost*0.15)}% vs premium express AIR, while maintaining defensible lead times."
+    def _generate_forensic_explanation(self, persona, trace, threat, transfer_count=0):
+        objective = {"FASTEST": "Transit time", "SAFEST": "Risk-weighted time", "BALANCED": "Time, freight cost and risk"}[persona]
+        eta, cost = sum(trace["eta"].values()), sum(trace["cost"].values())
+        return (f"{objective} optimized. Estimated transit plus buffers: {eta:.1f}h; "
+                f"freight and transfer cost: ${cost:.2f}; {transfer_count} transfers. "
+                f"Model buffer: {trace['eta']['model']:.1f}h; additional scenario buffer: "
+                f"{trace['eta']['scenario']:.1f}h; peak threat: {threat:.0%}.")
